@@ -1,0 +1,422 @@
+---
+title: "regression"
+format: html
+editor: visual
+---
+
+# List of required packages
+
+```{r}
+required_packages <- c(
+  "tidyverse",
+  "DataExplorer",
+  "caret",
+  "randomForest",
+  "xgboost",
+  "mice",
+  "corrplot",
+  "gridExtra",
+  "e1071",
+  "MLmetrics"
+)
+```
+
+# Install packages that are not yet installed
+
+```{r}
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+
+if(length(new_packages)) {
+  install.packages(new_packages)
+}
+```
+
+```{r}
+# Load all libraries
+lapply(required_packages, library, character.only = TRUE)
+```
+
+```{r}
+df <- read.csv("C:\\Users\\Alaa Mohamed\\Downloads\\Cleaned_Prices.csv")
+```
+
+# Inspect the data
+
+```{r}
+
+glimpse(df)
+summary(df)
+```
+
+```{r}
+# 'month' column is "YYYY-MM" format, convert to Date (set day=1)
+df$month <- as.Date(paste0(df$month, "-01"))
+# Convert year to integer
+df$year <- as.integer(df$year)
+```
+
+```{r}
+# Convert numeric columns which may be read as character
+num_cols <- c("storey", "area_sqm", "lease_start", "lease_rem", 
+              "resale_price", "price_psm", "price_psm_yearly", "Core.CPI", 
+              "price_cpi_adj", "price_psm_cpi_adj", "bala_lease_pct", 
+              "price_lease_adj_implied", "price_psm_lease_adj_implied", 
+              "price_cpi_lease_adj_implied", "price_psm_cpi_lease_adj_implied", 
+              "year_gni")
+```
+
+```{r}
+# Check columns exist before conversion
+num_cols <- intersect(num_cols, names(df))
+
+```
+
+```{r}
+# Convert them to numeric (some may have non-numeric issues)
+for(col in num_cols){
+  df[[col]] <- as.numeric(df[[col]])
+}
+```
+
+```{r}
+# Convert categorical variables
+cat_cols <- c("town", "flat_type", "flat_model", "storey_range")
+cat_cols <- intersect(cat_cols, names(df))
+df[cat_cols] <- lapply(df[cat_cols], as.factor)
+
+```
+
+```{r}
+# Clean any whitespace in string columns if any
+str_cols <- names(df)[sapply(df, is.character)]
+for(col in str_cols){
+  df[[col]] <- trimws(df[[col]])
+}
+```
+
+```{r}
+# Check missing data counts per column
+missing_counts <- sapply(df, function(x) sum(is.na(x)))
+print("Missing data count per column:")
+print(missing_counts)
+
+```
+
+```{r}
+# Visualize missing data pattern
+plot_missing(df)  # From DataExplorer
+
+```
+
+```{r}
+# Separate numeric and categorical columns for imputation
+num_vars <- names(df)[sapply(df, is.numeric)]
+cat_vars <- names(df)[sapply(df, is.factor)]
+
+```
+
+```{r}
+# Impute numeric missing values with MICE (pmm)
+if(any(missing_counts[num_vars] > 0)){
+  set.seed(123)
+  mice_mod <- mice(df[num_vars], m=5, maxit=10, method='pmm', seed=500)
+  mice_complete <- complete(mice_mod)
+  df[num_vars] <- mice_complete
+}
+
+```
+
+```{r}
+# Function to compute mode for categorical imputation
+get_mode <- function(v){
+  v <- v[!is.na(v)]
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+```
+
+```{r}
+# Impute missing categorical variables with mode
+for(col in cat_vars){
+  if(any(is.na(df[[col]]))){
+    mode_val <- get_mode(df[[col]])
+    df[[col]][is.na(df[[col]])] <- mode_val
+  }
+}
+```
+
+```{r}
+# Confirm no missing data now
+missing_counts_post <- sapply(df, function(x) sum(is.na(x)))
+print("Missing data count after imputation:")
+print(missing_counts_post)
+```
+
+```{r}
+# Visualize boxplots for numeric variables to detect outliers
+numeric_plots <- lapply(num_vars, function(x){
+  ggplot(df, aes_string(y = x)) +
+    geom_boxplot(outlier.colour = "red", outlier.shape = 8) +
+    labs(title = paste("Boxplot of", x)) +
+    theme_minimal()
+})
+
+```
+
+```{r}
+# Treat outliers using IQR capping
+cap_outliers <- function(x){
+  Q1 <- quantile(x, 0.25, na.rm=TRUE)
+  Q3 <- quantile(x, 0.75, na.rm=TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5*IQR
+  upper_bound <- Q3 + 1.5*IQR
+  x[x < lower_bound] <- lower_bound
+  x[x > upper_bound] <- upper_bound
+  return(x)
+}
+
+```
+
+```{r}
+# Apply capping on numeric columns except target variables (we'll do for targets separately)
+# Let's assume resale_price is the target; do not cap yet, handle separately
+
+num_vars_no_target <- setdiff(num_vars, c("resale_price", "price_psm"))
+
+df[num_vars_no_target] <- lapply(df[num_vars_no_target], cap_outliers)
+```
+
+```{r}
+# For resale_price and price_psm, check skewness and consider log transform if highly skewed
+skew_resale <- skewness(df$resale_price, na.rm=TRUE)
+skew_psm <- skewness(df$price_psm, na.rm=TRUE)
+print(paste("Skewness of resale_price:", round(skew_resale,2)))
+print(paste("Skewness of price_psm:", round(skew_psm,2)))
+# If skewness > 1 or < -1, transform
+if(abs(skew_resale) > 1){
+  df$log_resale_price <- log1p(df$resale_price) # log(1+x) to avoid log(0)
+} else {
+  df$log_resale_price <- df$resale_price
+}
+
+if(abs(skew_psm) > 1){
+  df$log_price_psm <- log1p(df$price_psm)
+} else {
+  df$log_price_psm <- df$price_psm
+}
+
+```
+
+# Exploratory Data Analysis (EDA)
+
+```{r}
+  #  Summary statistics
+summary(df[c("resale_price", "price_psm", "area_sqm", "lease_rem", "storey")])
+
+```
+
+```{r}
+#  Distribution plots for target variables (raw and log transformed)
+p1 <- ggplot(df, aes(resale_price)) + geom_histogram(bins=50, fill='blue', alpha=0.6) + ggtitle("Resale Price Distribution")
+p2 <- ggplot(df, aes(log_resale_price)) + geom_histogram(bins=50, fill='green', alpha=0.6) + ggtitle("Log Resale Price Distribution")
+grid.arrange(p1, p2, ncol=2)
+```
+
+```{r}
+#  Correlation heatmap for numeric variables (exclude transformed targets)
+num_vars_eda <- c("resale_price", "price_psm", "area_sqm", "lease_rem", "storey", "lease_start", "year_gni")
+cor_mat <- cor(df[num_vars_eda], use = "pairwise.complete.obs")
+corrplot(cor_mat, method = "color", addCoef.col = "black", number.cex=0.7, tl.cex=0.8, tl.col="black")
+```
+
+```{r}
+
+#  Scatterplots of resale_price vs top correlated numeric predictors
+top_corr_vars <- names(sort(abs(cor_mat[,"resale_price"]), decreasing = TRUE))[2:5]  # exclude resale_price itself
+
+for(var in top_corr_vars){
+  p <- ggplot(df, aes_string(x = var, y = "resale_price")) + 
+    geom_point(alpha=0.3) + 
+    geom_smooth(method='lm', col='red') + 
+    ggtitle(paste("Resale Price vs", var))
+  print(p)
+}
+```
+
+```{r}
+#  Boxplots for categorical variables vs target
+for(cat_col in cat_cols){
+  p <- ggplot(df, aes_string(x = cat_col, y = "resale_price")) +
+    geom_boxplot() +
+    theme(axis.text.x = element_text(angle=45, hjust=1)) +
+    ggtitle(paste("Resale Price by", cat_col))
+  print(p)
+}
+
+```
+
+```{r}
+# Step 6: Feature Engineering & Final Preprocessing for Modeling
+# Drop irrelevant columns:
+# Columns like 'month', 'address', 'street_name', 'block' are high cardinality or textual - remove for now
+df_model <- df %>% select(-month, -address, -street_name, -block)
+
+```
+
+```{r}
+# Use log_resale_price as target to reduce skewness in modeling
+target_var <- "log_resale_price"
+```
+
+```{r}
+# Encode categorical variables using one-hot encoding (caret dummyVars)
+df_model[cat_cols] <- lapply(df_model[cat_cols], as.factor)
+dummy_obj <- dummyVars(~., data = df_model %>% select(-all_of(target_var)))
+df_cat_ohe <- predict(dummy_obj, newdata = df_model %>% select(-all_of(target_var))) %>% as.data.frame()
+
+```
+
+```{r}
+# Final modeling dataframe: combine encoded cat + numeric + target
+df_final <- cbind(df_cat_ohe, df_model[[target_var]])
+colnames(df_final)[ncol(df_final)] <- target_var
+
+```
+
+```{r}
+# Check no missing
+sum(is.na(df_final))
+
+
+```
+
+# Train-Test Split
+
+```{r}
+set.seed(1234)
+train_index <- createDataPartition(df_final[[target_var]], p=0.8, list=FALSE)
+train_data <- df_final[train_index, ]
+test_data <- df_final[-train_index, ]
+
+train_x <- train_data %>% select(-all_of(target_var))
+train_y <- train_data[[target_var]]
+
+test_x <- test_data %>% select(-all_of(target_var))
+test_y <- test_data[[target_var]]
+```
+
+# Model Training and Hyperparameter Tuning
+
+```{r}
+
+# Define cross-validation strategy
+fit_control <- trainControl(method = "cv", number = 5)
+
+# 8.1 Linear Regression (baseline)
+set.seed(123)
+lm_model <- train(
+  x = train_x,
+  y = train_y,
+  method = "lm",
+  trControl = fit_control
+)
+```
+
+# Random Forest Regressorison
+
+```{r}
+#  Random Forest Regressor
+set.seed(123)
+rf_model <- train(
+  x = train_x,
+  y = train_y,
+  method = "rf",
+  trControl = fit_control,
+  tuneLength = 5
+)
+
+```
+
+# XGBoost Regressor
+
+```{r}
+set.seed(123)
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(4, 6),
+  eta = c(0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+xgb_model <- train(
+  x = train_x,
+  y = train_y,
+  method = "xgbTree",
+  trControl = fit_control,
+  tuneGrid = xgb_grid,
+  verbose = FALSE
+)
+
+
+```
+
+# Model Evaluation
+
+```{r}
+
+
+# Function to compute evaluation metrics on original scale (undo log)
+evaluate_model <- function(model, test_x, test_y_log){
+  pred_log <- predict(model, test_x)
+  # Convert back from log scale
+  pred <- expm1(pred_log)
+  actual <- expm1(test_y_log)
+  
+  rmse_val <- RMSE(pred, actual)
+  r2_val <- R2_Score(pred, actual)
+  mae_val <- MAE(pred, actual)
+  
+  return(data.frame(RMSE = rmse_val, R2 = r2_val, MAE = mae_val))
+}
+
+
+```
+
+```{r}
+lm_eval <- evaluate_model(lm_model, test_x, test_y)
+rf_eval <- evaluate_model(rf_model, test_x, test_y)
+xgb_eval <- evaluate_model(xgb_model, test_x, test_y)
+
+eval_results <- rbind(
+  Linear_Regression = lm_eval,
+  Random_Forest = rf_eval,
+  XGBoost = xgb_eval
+)
+
+print("Model evaluation results:")
+print(eval_results)
+
+```
+
+# Conclusion & Next Steps
+
+```{r}
+
+# Identify best model based on RMSE
+best_model_name <- rownames(eval_results)[which.min(eval_results$RMSE)]
+cat("Best model based on RMSE is:", best_model_name, "\n")
+
+# Save best model if needed
+# saveRDS(get(paste0(tolower(best_model_name), "_model")), file = paste0(best_model_name, "_model.rds"))
+
+# Suggest feature importance plot for Random Forest and XGBoost
+varImp_rf <- varImp(rf_model)
+plot(varImp_rf, top = 20, main = "Random Forest Variable Importance")
+
+varImp_xgb <- varImp(xgb_model)
+plot(varImp_xgb, top = 20, main = "XGBoost Variable Importance")
+```
